@@ -17,20 +17,19 @@ app = FastAPI(
 )
 
 # ── CONFIGURACIÓN BD SUPABASE ─────────────────────────────────────────────────
-# Local: meter las strings directas
-# Render: usar variables de entorno (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT)
+# Render: añadir variable de entorno DATABASE_URL con la string completa de Supabase
+# Formato: postgresql://postgres:PASSWORD@db.xxxx.supabase.co:5432/postgres
 
-DB_PARAMS = {
-    "dbname":   os.environ.get("DB_NAME"),
-    "user":     os.environ.get("DB_USER"),
-    "password": os.environ.get("DB_PASSWORD"),
-    "host":     os.environ.get("DB_HOST"),
-    "port":     int(os.environ.get("DB_PORT"))
-}
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:TU_PASSWORD@db.hwxlefrfvntznjbgmkwy.supabase.co:5432/postgres"
+)
+
+def get_conn():
+    """Abre una conexión a Supabase con SSL obligatorio."""
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 # ── CATÁLOGO OFICIAL DE TAGS ──────────────────────────────────────────────────
-# 30 tags acordados con Marketing y Data Science
-# Cualquier tag fuera de esta lista se ignora silenciosamente
 
 TAGS_OFICIALES = [
     "after-party", "after-work", "cuidarme", "brunch", "pelis",
@@ -41,7 +40,7 @@ TAGS_OFICIALES = [
     "tradicional", "chill", "vermut", "deportes-extremos", "caprichos"
 ]
 
-TAGS_SET = set(TAGS_OFICIALES)  # para lookups O(1)
+TAGS_SET = set(TAGS_OFICIALES)
 
 # ── MODELOS DE DATOS ──────────────────────────────────────────────────────────
 
@@ -65,20 +64,24 @@ class RecomendacionesRequest(BaseModel):
 
 class ActualizarTagsRequest(BaseModel):
     user_id: int
-    tags: List[str]  # hasta 9 tags del perfil del usuario
+    tags: List[str]
 
 class ActualizarPesosRequest(BaseModel):
     user_id: int
-    activity_tags: List[str]       # tags de la actividad valorada
-    score_servicio: int            # 1-5
-    score_ambiente: int            # 1-5
-    score_calidad_precio: int      # 1-5
+    activity_tags: List[str]
+    score_servicio: int
+    score_ambiente: int
+    score_calidad_precio: int
 
 # ── FUNCIONES DE BD ───────────────────────────────────────────────────────────
 
 def obtener_o_crear_pesos(user_id: int) -> dict:
+    """
+    Busca los pesos del usuario en Supabase.
+    Si no existe, lo inicializa con todos los tags a 0.0 (cold-start).
+    """
     try:
-        conn = psycopg2.connect(**DB_PARAMS)
+        conn = get_conn()
         cur = conn.cursor()
         try:
             cur.execute("SELECT weights FROM user_weights WHERE user_id = %s;", (user_id,))
@@ -96,29 +99,30 @@ def obtener_o_crear_pesos(user_id: int) -> dict:
             cur.close()
             conn.close()
     except Exception as e:
-        logger.error(f"Error BD: {e}")
+        logger.error(f"Error BD obtener_pesos: {e}")
         raise
 
 def guardar_pesos(user_id: int, pesos: dict):
-    """
-    Guarda o sobreescribe los pesos del usuario en Supabase.
-    Usa UPSERT para manejar tanto inserts como updates.
-    """
-    conn = psycopg2.connect(**DB_PARAMS)
-    cur = conn.cursor()
+    """Guarda o sobreescribe los pesos del usuario en Supabase."""
     try:
-        cur.execute("""
-            INSERT INTO user_weights (user_id, weights, updated_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (user_id)
-            DO UPDATE SET
-                weights    = EXCLUDED.weights,
-                updated_at = CURRENT_TIMESTAMP;
-        """, (user_id, Json(pesos)))
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO user_weights (user_id, weights, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    weights    = EXCLUDED.weights,
+                    updated_at = CURRENT_TIMESTAMP;
+            """, (user_id, Json(pesos)))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error BD guardar_pesos: {e}")
+        raise
 
 # ── HELPER: DISTANCIA HAVERSINE ───────────────────────────────────────────────
 
@@ -146,29 +150,17 @@ def health_check():
 def post_recomendaciones(req: RecomendacionesRequest):
     """
     Devuelve las top_n actividades más compatibles con el perfil del usuario.
-
-    Flujo:
-      1. Obtener pesos del usuario desde Supabase
-      2. Filtrar actividades por time_slot
-      3. Filtrar actividades a menos de 40 km (Haversine)
-      4. Calcular score ponderado por coincidencia de tags
-      5. Ordenar por score DESC y devolver top_n
+    Filtra por time_slot y distancia máxima 40 km. Ordena por score ponderado.
     """
     weights = obtener_o_crear_pesos(req.user_id)
     candidatas = []
 
     for act in req.activities:
-
-        # Filtro 1: time_slot debe coincidir exactamente
         if act.time_slot.lower() != req.time_slot.lower():
             continue
-
-        # Filtro 2: distancia máxima 40 km
         distancia = haversine_km(req.lat, req.lng, act.lat, act.lng)
         if distancia > 40.0:
             continue
-
-        # Score: media de los pesos del usuario para los tags de la actividad
         tags_act = [
             t for t in [
                 act.activity_category_id_1,
@@ -180,7 +172,6 @@ def post_recomendaciones(req: RecomendacionesRequest):
             sum(weights.get(t, 0.0) for t in tags_act) / len(tags_act)
             if tags_act else 0.0
         )
-
         candidatas.append({
             "activity_id":  act.id,
             "name":         act.name,
@@ -197,23 +188,14 @@ def post_actualizar_tags(req: ActualizarTagsRequest):
     """
     El usuario ha modificado sus tags en el perfil.
     Sube +0.1 a cada tag seleccionado (tope 1.0).
-    Ignora tags que no están en el catálogo oficial.
     """
     weights = obtener_o_crear_pesos(req.user_id)
-
-    tags_validos = [t for t in req.tags if t in TAGS_SET]
+    tags_validos   = [t for t in req.tags if t in TAGS_SET]
     tags_ignorados = [t for t in req.tags if t not in TAGS_SET]
-
     for tag in tags_validos:
         weights[tag] = round(min(weights[tag] + 0.1, 1.0), 3)
-
     guardar_pesos(req.user_id, weights)
-
-    return {
-        "ok":              True,
-        "weights":         weights,
-        "tags_ignorados":  tags_ignorados  # útil para que Full Stack detecte errores
-    }
+    return {"ok": True, "weights": weights, "tags_ignorados": tags_ignorados}
 
 
 @app.post("/actualizar-pesos")
@@ -221,15 +203,8 @@ def post_actualizar_pesos(req: ActualizarPesosRequest):
     """
     El usuario ha dejado una reseña.
     Actualiza los pesos de los tags de la actividad valorada.
-
-    Fórmula:
-      val_media = (score_servicio + score_ambiente + score_calidad_precio) / 3
-      val_norm  = (val_media - 1) / 4    →  escala 1-5 a 0.0-1.0
-      peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
-
-    Ignora tags que no están en el catálogo oficial.
+    peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
     """
-    # Validar rangos de puntuaciones
     for campo, valor in [
         ("score_servicio",       req.score_servicio),
         ("score_ambiente",       req.score_ambiente),
@@ -242,21 +217,16 @@ def post_actualizar_pesos(req: ActualizarPesosRequest):
             )
 
     weights = obtener_o_crear_pesos(req.user_id)
-
     val_media = (req.score_servicio + req.score_ambiente + req.score_calidad_precio) / 3.0
     val_norm  = (val_media - 1.0) / 4.0
-
     tags_validos   = [t for t in req.activity_tags if t in TAGS_SET]
     tags_ignorados = [t for t in req.activity_tags if t not in TAGS_SET]
-
     for tag in tags_validos:
         weights[tag] = round(weights[tag] * 0.9 + val_norm * 0.1, 3)
-
     guardar_pesos(req.user_id, weights)
-
     return {
-        "ok":              True,
-        "weights":         weights,
-        "val_norm":        round(val_norm, 3),   # útil para depuración
-        "tags_ignorados":  tags_ignorados
+        "ok":             True,
+        "weights":        weights,
+        "val_norm":       round(val_norm, 3),
+        "tags_ignorados": tags_ignorados
     }
