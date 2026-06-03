@@ -26,8 +26,17 @@ DATABASE_URL = os.environ.get(
 )
 
 def get_conn():
-    """Abre una conexión a Supabase con SSL obligatorio."""
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    """Abre una conexión a Supabase forzando IPv4."""
+    import socket
+    # Forzar resolución IPv4
+    orig_getaddrinfo = socket.getaddrinfo
+    def getaddrinfo_ipv4(*args, **kwargs):
+        kwargs['family'] = socket.AF_INET
+        return orig_getaddrinfo(*args, **kwargs)
+    socket.getaddrinfo = getaddrinfo_ipv4
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    socket.getaddrinfo = orig_getaddrinfo
+    return conn
 
 # ── CATÁLOGO OFICIAL DE TAGS ──────────────────────────────────────────────────
 
