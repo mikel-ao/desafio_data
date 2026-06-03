@@ -5,6 +5,10 @@ import math
 import psycopg2
 from psycopg2.extras import Json
 import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Motor de Recomendación — Data Science",
@@ -73,28 +77,27 @@ class ActualizarPesosRequest(BaseModel):
 # ── FUNCIONES DE BD ───────────────────────────────────────────────────────────
 
 def obtener_o_crear_pesos(user_id: int) -> dict:
-    """
-    Busca los pesos del usuario en Supabase.
-    Si no existe, lo inicializa con todos los tags a 0.0 (cold-start).
-    """
-    conn = psycopg2.connect(**DB_PARAMS)
-    cur = conn.cursor()
     try:
-        cur.execute("SELECT weights FROM user_weights WHERE user_id = %s;", (user_id,))
-        row = cur.fetchone()
-        if row:
-            return row[0]
-        # Cold-start: usuario nuevo → todos los pesos a 0.0
-        pesos_iniciales = {tag: 0.0 for tag in TAGS_OFICIALES}
-        cur.execute(
-            "INSERT INTO user_weights (user_id, weights) VALUES (%s, %s);",
-            (user_id, Json(pesos_iniciales))
-        )
-        conn.commit()
-        return pesos_iniciales
-    finally:
-        cur.close()
-        conn.close()
+        conn = psycopg2.connect(**DB_PARAMS)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT weights FROM user_weights WHERE user_id = %s;", (user_id,))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            pesos_iniciales = {tag: 0.0 for tag in TAGS_OFICIALES}
+            cur.execute(
+                "INSERT INTO user_weights (user_id, weights) VALUES (%s, %s);",
+                (user_id, Json(pesos_iniciales))
+            )
+            conn.commit()
+            return pesos_iniciales
+        finally:
+            cur.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error BD: {e}")
+        raise
 
 def guardar_pesos(user_id: int, pesos: dict):
     """
