@@ -2,8 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import math
-import psycopg2
-from psycopg2.extras import Json
+import sqlite3
 import os
 import logging
 
@@ -16,29 +15,12 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# ── CONFIGURACIÓN BD SUPABASE ─────────────────────────────────────────────────
-# Render: añadir variable de entorno DATABASE_URL con la string completa de Supabase
-# Formato: postgresql://postgres:PASSWORD@db.xxxx.supabase.co:5432/postgres
+# ── CONFIGURACIÓN BD SQLITE ───────────────────────────────────────────────────
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://postgres:TU_PASSWORD@db.hwxlefrfvntznjbgmkwy.supabase.co:5432/postgres"
-)
-
-def get_conn():
-    """Abre una conexión a Supabase forzando IPv4."""
-    import socket
-    # Forzar resolución IPv4
-    orig_getaddrinfo = socket.getaddrinfo
-    def getaddrinfo_ipv4(*args, **kwargs):
-        kwargs['family'] = socket.AF_INET
-        return orig_getaddrinfo(*args, **kwargs)
-    socket.getaddrinfo = getaddrinfo_ipv4
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    socket.getaddrinfo = orig_getaddrinfo
-    return conn
+DB_PATH = os.environ.get("DB_PATH", "weights.db")
 
 # ── CATÁLOGO OFICIAL DE TAGS ──────────────────────────────────────────────────
+# Los guiones se convierten a guiones bajos para los nombres de columna SQL
 
 TAGS_OFICIALES = [
     "after-party", "after-work", "cuidarme", "brunch", "pelis",
@@ -50,6 +32,95 @@ TAGS_OFICIALES = [
 ]
 
 TAGS_SET = set(TAGS_OFICIALES)
+
+def tag_a_col(tag: str) -> str:
+    """Convierte un tag a nombre de columna SQL. Ej: after-party → after_party"""
+    return tag.replace("-", "_")
+
+def col_a_tag(col: str) -> str:
+    """Convierte un nombre de columna SQL a tag. Ej: after_party → after-party"""
+    return col.replace("_", "-")
+
+COLUMNAS = [tag_a_col(t) for t in TAGS_OFICIALES]
+
+# ── INICIALIZACIÓN DE LA BD ───────────────────────────────────────────────────
+
+def init_db():
+    """Crea la tabla user_weights si no existe."""
+    cols_sql = ",\n    ".join([f"{col} REAL DEFAULT 0.0" for col in COLUMNAS])
+    sql = f"""
+        CREATE TABLE IF NOT EXISTS user_weights (
+            user_id INTEGER PRIMARY KEY,
+            {cols_sql}
+        );
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(sql)
+    conn.commit()
+    conn.close()
+    logger.info(f"BD inicializada en {DB_PATH}")
+
+init_db()
+
+# ── FUNCIONES DE BD ───────────────────────────────────────────────────────────
+
+def obtener_o_crear_pesos(user_id: int) -> dict:
+    """
+    Busca los pesos del usuario en SQLite.
+    Si no existe, lo inicializa con todos los tags a 0.0 (cold-start).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM user_weights WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+        if row:
+            # Convertir columnas SQL de vuelta a tags con guiones
+            return {col_a_tag(col): row[col] for col in COLUMNAS}
+
+        # Cold-start: usuario nuevo → INSERT con todos los pesos a 0.0
+        cols_str = ", ".join(COLUMNAS)
+        vals_str = ", ".join(["0.0"] * len(COLUMNAS))
+        conn.execute(
+            f"INSERT INTO user_weights (user_id, {cols_str}) VALUES (?, {vals_str})",
+            (user_id,)
+        )
+        conn.commit()
+        return {tag: 0.0 for tag in TAGS_OFICIALES}
+    finally:
+        conn.close()
+
+def guardar_pesos(user_id: int, pesos: dict):
+    """Actualiza los pesos del usuario en SQLite."""
+    set_clauses = ", ".join([f"{tag_a_col(tag)} = ?" for tag in TAGS_OFICIALES])
+    valores = [pesos.get(tag, 0.0) for tag in TAGS_OFICIALES]
+    valores.append(user_id)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            f"UPDATE user_weights SET {set_clauses} WHERE user_id = ?",
+            valores
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+# ── HELPER: DISTANCIA HAVERSINE ───────────────────────────────────────────────
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Distancia en km entre dos coordenadas."""
+    R = 6371.0
+    rad = math.pi / 180
+    dlat = (lat2 - lat1) * rad
+    dlng = (lng2 - lng1) * rad
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1 * rad) * math.cos(lat2 * rad) * math.sin(dlng / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 # ── MODELOS DE DATOS ──────────────────────────────────────────────────────────
 
@@ -71,10 +142,6 @@ class RecomendacionesRequest(BaseModel):
     activities: List[ActivityInput]
     top_n: Optional[int] = 5
 
-class ActualizarTagsRequest(BaseModel):
-    user_id: int
-    tags: List[str]
-
 class ActualizarPesosRequest(BaseModel):
     user_id: int
     activity_tags: List[str]
@@ -82,76 +149,11 @@ class ActualizarPesosRequest(BaseModel):
     score_ambiente: int
     score_calidad_precio: int
 
-# ── FUNCIONES DE BD ───────────────────────────────────────────────────────────
-
-def obtener_o_crear_pesos(user_id: int) -> dict:
-    """
-    Busca los pesos del usuario en Supabase.
-    Si no existe, lo inicializa con todos los tags a 0.0 (cold-start).
-    """
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT weights FROM user_weights WHERE user_id = %s;", (user_id,))
-            row = cur.fetchone()
-            if row:
-                return row[0]
-            pesos_iniciales = {tag: 0.0 for tag in TAGS_OFICIALES}
-            cur.execute(
-                "INSERT INTO user_weights (user_id, weights) VALUES (%s, %s);",
-                (user_id, Json(pesos_iniciales))
-            )
-            conn.commit()
-            return pesos_iniciales
-        finally:
-            cur.close()
-            conn.close()
-    except Exception as e:
-        logger.error(f"Error BD obtener_pesos: {e}")
-        raise
-
-def guardar_pesos(user_id: int, pesos: dict):
-    """Guarda o sobreescribe los pesos del usuario en Supabase."""
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                INSERT INTO user_weights (user_id, weights, updated_at)
-                VALUES (%s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (user_id)
-                DO UPDATE SET
-                    weights    = EXCLUDED.weights,
-                    updated_at = CURRENT_TIMESTAMP;
-            """, (user_id, Json(pesos)))
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
-    except Exception as e:
-        logger.error(f"Error BD guardar_pesos: {e}")
-        raise
-
-# ── HELPER: DISTANCIA HAVERSINE ───────────────────────────────────────────────
-
-def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Distancia en km entre dos coordenadas usando la fórmula de Haversine."""
-    R = 6371.0
-    rad = math.pi / 180
-    dlat = (lat2 - lat1) * rad
-    dlng = (lng2 - lng1) * rad
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1 * rad) * math.cos(lat2 * rad) * math.sin(dlng / 2) ** 2
-    )
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def health_check():
-    """Health check para Render y monitorización."""
+    """Health check."""
     return {"status": "ok", "service": "Motor de Recomendación — Data Science"}
 
 
@@ -159,17 +161,28 @@ def health_check():
 def post_recomendaciones(req: RecomendacionesRequest):
     """
     Devuelve las top_n actividades más compatibles con el perfil del usuario.
-    Filtra por time_slot y distancia máxima 40 km. Ordena por score ponderado.
+
+    Flujo:
+      1. Obtener pesos del usuario desde SQLite
+      2. Filtrar actividades por time_slot
+      3. Filtrar actividades a menos de 40 km (Haversine)
+      4. Calcular score ponderado por coincidencia de tags
+      5. Ordenar por score DESC y devolver top_n
     """
     weights = obtener_o_crear_pesos(req.user_id)
     candidatas = []
 
     for act in req.activities:
+        # Filtro 1: time_slot
         if act.time_slot.lower() != req.time_slot.lower():
             continue
+
+        # Filtro 2: distancia máxima 40 km
         distancia = haversine_km(req.lat, req.lng, act.lat, act.lng)
         if distancia > 40.0:
             continue
+
+        # Score: media de los pesos para los tags de la actividad
         tags_act = [
             t for t in [
                 act.activity_category_id_1,
@@ -181,6 +194,7 @@ def post_recomendaciones(req: RecomendacionesRequest):
             sum(weights.get(t, 0.0) for t in tags_act) / len(tags_act)
             if tags_act else 0.0
         )
+
         candidatas.append({
             "activity_id":  act.id,
             "name":         act.name,
@@ -192,28 +206,18 @@ def post_recomendaciones(req: RecomendacionesRequest):
     return candidatas[:req.top_n]
 
 
-@app.post("/actualizar-tags")
-def post_actualizar_tags(req: ActualizarTagsRequest):
-    """
-    El usuario ha modificado sus tags en el perfil.
-    Sube +0.1 a cada tag seleccionado (tope 1.0).
-    """
-    weights = obtener_o_crear_pesos(req.user_id)
-    tags_validos   = [t for t in req.tags if t in TAGS_SET]
-    tags_ignorados = [t for t in req.tags if t not in TAGS_SET]
-    for tag in tags_validos:
-        weights[tag] = round(min(weights[tag] + 0.1, 1.0), 3)
-    guardar_pesos(req.user_id, weights)
-    return {"ok": True, "weights": weights, "tags_ignorados": tags_ignorados}
-
-
 @app.post("/actualizar-pesos")
 def post_actualizar_pesos(req: ActualizarPesosRequest):
     """
     El usuario ha dejado una reseña.
     Actualiza los pesos de los tags de la actividad valorada.
-    peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
+
+    Fórmula:
+      val_media = (score_servicio + score_ambiente + score_calidad_precio) / 3
+      val_norm  = (val_media - 1) / 4    →  escala 1-5 a 0.0-1.0
+      peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
     """
+    # Validar rangos
     for campo, valor in [
         ("score_servicio",       req.score_servicio),
         ("score_ambiente",       req.score_ambiente),
@@ -226,13 +230,18 @@ def post_actualizar_pesos(req: ActualizarPesosRequest):
             )
 
     weights = obtener_o_crear_pesos(req.user_id)
+
     val_media = (req.score_servicio + req.score_ambiente + req.score_calidad_precio) / 3.0
     val_norm  = (val_media - 1.0) / 4.0
+
     tags_validos   = [t for t in req.activity_tags if t in TAGS_SET]
     tags_ignorados = [t for t in req.activity_tags if t not in TAGS_SET]
+
     for tag in tags_validos:
         weights[tag] = round(weights[tag] * 0.9 + val_norm * 0.1, 3)
+
     guardar_pesos(req.user_id, weights)
+
     return {
         "ok":             True,
         "weights":        weights,
