@@ -179,7 +179,7 @@ def post_recomendaciones(req: RecomendacionesRequest):
         if distancia > 40.0:
             continue
 
-        tags_act = [t for t in [act["tag_1"], act["tag_2"], act["tag_3"]] if t]
+        tags_act = list(dict.fromkeys([t for t in [act["tag_1"], act["tag_2"], act["tag_3"]] if t]))
         score = (
             sum(weights.get(t, 0.0) for t in tags_act) / len(tags_act)
             if tags_act else 0.0
