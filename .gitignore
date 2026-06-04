@@ -47,4 +47,5 @@ logs/
 htmlcov/
 
 # Mypy
-.mypy_cache/
+.mypy_cache/weights.db
+data/
