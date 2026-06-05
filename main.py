@@ -17,7 +17,6 @@ app = FastAPI(
 )
 
 # ── CONFIGURACIÓN BD ──────────────────────────────────────────────────────────
-# Internal URL para Render (sin SSL), External URL para local (con SSL)
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -25,12 +24,9 @@ DATABASE_URL = os.environ.get(
 )
 
 def get_conn():
-    """Abre una conexión a PostgreSQL."""
     try:
-        # Intento sin SSL (Internal URL dentro de Render)
         return psycopg2.connect(DATABASE_URL)
     except Exception:
-        # Fallback con SSL (External URL desde local)
         return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 # ── CATÁLOGO OFICIAL DE TAGS ──────────────────────────────────────────────────
@@ -68,9 +64,8 @@ def obtener_o_crear_pesos(user_id: int) -> dict:
             row = cur.fetchone()
             if row:
                 return {col_a_tag(col): float(row[col]) for col in COLUMNAS}
-            # Cold-start
-            cols_str  = ", ".join(COLUMNAS)
-            vals_str  = ", ".join(["0.0"] * len(COLUMNAS))
+            cols_str = ", ".join(COLUMNAS)
+            vals_str = ", ".join(["0.0"] * len(COLUMNAS))
             cur.execute(
                 f"INSERT INTO user_weights (user_id, {cols_str}) VALUES (%s, {vals_str})",
                 (user_id,)
@@ -97,7 +92,10 @@ def guardar_pesos(user_id: int, pesos: dict):
         conn.close()
 
 def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
-    """Consulta actividades filtrando por time_slot y opcionalmente municipio."""
+    """
+    Consulta actividades filtrando por time_slot, vigencia y opcionalmente municipio.
+    Solo devuelve actividades cuya fecha_fin >= hoy o sin fecha (exposiciones permanentes).
+    """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -109,6 +107,7 @@ def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
                     WHERE LOWER(time_slot) = LOWER(%s)
                     AND LOWER(municipio) LIKE LOWER(%s)
                     AND is_active = 1
+                    AND (fecha_fin IS NULL OR fecha_fin >= CURRENT_DATE)
                 """, (time_slot, f"%{municipio}%"))
             else:
                 cur.execute("""
@@ -117,6 +116,7 @@ def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
                     FROM activities
                     WHERE LOWER(time_slot) = LOWER(%s)
                     AND is_active = 1
+                    AND (fecha_fin IS NULL OR fecha_fin >= CURRENT_DATE)
                 """, (time_slot,))
             return [dict(r) for r in cur.fetchall()]
     finally:
@@ -163,7 +163,13 @@ def health_check():
 def post_recomendaciones(req: RecomendacionesRequest):
     """
     Devuelve las top_n actividades más compatibles con el perfil del usuario.
-    Filtra por time_slot y distancia máxima 40 km. Ordena por score ponderado.
+
+    Flujo:
+      1. Obtener pesos del usuario desde PostgreSQL
+      2. Consultar actividades vigentes filtrando por time_slot y municipio
+      3. Filtrar actividades a menos de 40 km (Haversine)
+      4. Calcular score ponderado por coincidencia de tags (sin duplicados)
+      5. Ordenar por score DESC y devolver top_n
     """
     weights    = obtener_o_crear_pesos(req.user_id)
     activities = obtener_activities(req.time_slot, req.municipio)
@@ -179,7 +185,11 @@ def post_recomendaciones(req: RecomendacionesRequest):
         if distancia > 40.0:
             continue
 
-        tags_act = list(dict.fromkeys([t for t in [act["tag_1"], act["tag_2"], act["tag_3"]] if t]))
+        # Deduplicar tags — si una actividad tiene [cultura, cultura, arte]
+        # se queda con [cultura, arte]
+        tags_act = list(dict.fromkeys([
+            t for t in [act["tag_1"], act["tag_2"], act["tag_3"]] if t
+        ]))
         score = (
             sum(weights.get(t, 0.0) for t in tags_act) / len(tags_act)
             if tags_act else 0.0
@@ -204,7 +214,11 @@ def post_actualizar_pesos(req: ActualizarPesosRequest):
     """
     El usuario ha dejado una reseña.
     Actualiza los pesos de los tags de la actividad valorada.
-    peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
+
+    Fórmula:
+      val_media = (score_servicio + score_ambiente + score_calidad_precio) / 3
+      val_norm  = (val_media - 1) / 4    →  escala 1-5 a 0.0-1.0
+      peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
     """
     for campo, valor in [
         ("score_servicio",       req.score_servicio),
