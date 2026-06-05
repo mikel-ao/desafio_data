@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from datetime import date, timedelta
 from typing import List, Optional
 import math
 import psycopg2
@@ -53,10 +54,6 @@ COLUMNAS = [tag_a_col(t) for t in TAGS_OFICIALES]
 # ── FUNCIONES DE BD ───────────────────────────────────────────────────────────
 
 def obtener_o_crear_pesos(user_id: int) -> dict:
-    """
-    Busca los pesos del usuario en PostgreSQL.
-    Si no existe, lo inicializa con todos los tags a 0.0 (cold-start).
-    """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -76,7 +73,6 @@ def obtener_o_crear_pesos(user_id: int) -> dict:
         conn.close()
 
 def guardar_pesos(user_id: int, pesos: dict):
-    """Actualiza los pesos del usuario en PostgreSQL."""
     set_clauses = ", ".join([f"{tag_a_col(tag)} = %s" for tag in TAGS_OFICIALES])
     valores     = [pesos.get(tag, 0.0) for tag in TAGS_OFICIALES]
     valores.append(user_id)
@@ -93,8 +89,8 @@ def guardar_pesos(user_id: int, pesos: dict):
 
 def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
     """
-    Consulta actividades filtrando por time_slot, vigencia y opcionalmente municipio.
-    Solo devuelve actividades cuya fecha_fin >= hoy o sin fecha (exposiciones permanentes).
+    Consulta actividades vigentes filtrando por time_slot y opcionalmente municipio.
+    Solo devuelve actividades cuya fecha_fin >= hoy o sin fecha.
     """
     conn = get_conn()
     try:
@@ -102,17 +98,17 @@ def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
             if municipio:
                 cur.execute("""
                     SELECT id, name, municipio, lat, lng,
-                           tag_1, tag_2, tag_3, time_slot, price
+                           tag_1, tag_2, tag_3, time_slot, price, fecha_fin
                     FROM activities
                     WHERE LOWER(time_slot) = LOWER(%s)
                     AND LOWER(municipio) LIKE LOWER(%s)
                     AND is_active = 1
-                    AND (fecha_fin IS NULL OR fecha_fin >= CURRENT_DATE)
+                    AND (fecha_fin IS NULL OR fecha_fin::date >= CURRENT_DATE)
                 """, (time_slot, f"%{municipio}%"))
             else:
                 cur.execute("""
                     SELECT id, name, municipio, lat, lng,
-                           tag_1, tag_2, tag_3, time_slot, price
+                           tag_1, tag_2, tag_3, time_slot, price, fecha_fin
                     FROM activities
                     WHERE LOWER(time_slot) = LOWER(%s)
                     AND is_active = 1
@@ -122,7 +118,7 @@ def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
     finally:
         conn.close()
 
-# ── HELPER: DISTANCIA HAVERSINE ───────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R   = 6371.0
@@ -134,6 +130,20 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
         + math.cos(lat1 * rad) * math.cos(lat2 * rad) * math.sin(dlng / 2) ** 2
     )
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def fecha_fin_display(fecha_fin_str):
+    """
+    Devuelve la fecha solo si el evento termina en menos de 30 días.
+    Si es una exposición permanente (fecha muy lejana) devuelve None.
+    """
+    if not fecha_fin_str:
+        return None
+    try:
+        fecha  = date.fromisoformat(str(fecha_fin_str)[:10])
+        limite = date.today() + timedelta(days=30)
+        return str(fecha) if fecha <= limite else None
+    except:
+        return None
 
 # ── MODELOS DE DATOS ──────────────────────────────────────────────────────────
 
@@ -185,8 +195,6 @@ def post_recomendaciones(req: RecomendacionesRequest):
         if distancia > 40.0:
             continue
 
-        # Deduplicar tags — si una actividad tiene [cultura, cultura, arte]
-        # se queda con [cultura, arte]
         tags_act = list(dict.fromkeys([
             t for t in [act["tag_1"], act["tag_2"], act["tag_3"]] if t
         ]))
@@ -203,6 +211,7 @@ def post_recomendaciones(req: RecomendacionesRequest):
             "distancia_km": round(distancia, 2),
             "tags":         tags_act,
             "price":        float(act["price"]) if act["price"] else 0.0,
+            "fecha_fin":    fecha_fin_display(act["fecha_fin"]),
         })
 
     candidatas.sort(key=lambda x: x["score"], reverse=True)
@@ -214,11 +223,7 @@ def post_actualizar_pesos(req: ActualizarPesosRequest):
     """
     El usuario ha dejado una reseña.
     Actualiza los pesos de los tags de la actividad valorada.
-
-    Fórmula:
-      val_media = (score_servicio + score_ambiente + score_calidad_precio) / 3
-      val_norm  = (val_media - 1) / 4    →  escala 1-5 a 0.0-1.0
-      peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
+    peso_nuevo = peso_actual * 0.9 + val_norm * 0.1
     """
     for campo, valor in [
         ("score_servicio",       req.score_servicio),
