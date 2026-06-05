@@ -19,10 +19,7 @@ app = FastAPI(
 
 # ── CONFIGURACIÓN BD ──────────────────────────────────────────────────────────
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://recomendador_ds_user:NJBcVxYoa7SrmDVRpCfmIHCCexWLsbDQ@dpg-d8ga02vlk1mc73elmv40-a.frankfurt-postgres.render.com/recomendador_ds"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_conn():
     try:
