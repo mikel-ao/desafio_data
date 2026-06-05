@@ -38,7 +38,7 @@ TAGS_OFICIALES = [
     "gastronomia", "juegos-de-mesa", "mercado", "tendencia",
     "conciertos", "nocturno", "outdoor", "pintxopote", "poteo",
     "rooftop", "talleres", "teatro", "terraceo", "comercio-local",
-    "tradicional", "chill", "vermut", "deportes-extremos", "caprichos"
+    "tradicional", "chill", "putivuelta", "deportes-extremos", "caprichos"
 ]
 
 TAGS_SET = set(TAGS_OFICIALES)
