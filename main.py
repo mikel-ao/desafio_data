@@ -116,7 +116,7 @@ def obtener_activities(time_slot: str, municipio: Optional[str] = None) -> list:
                     FROM activities
                     WHERE LOWER(time_slot) = LOWER(%s)
                     AND is_active = 1
-                    AND (fecha_fin IS NULL OR fecha_fin >= CURRENT_DATE)
+                    AND (fecha_fin IS NULL OR fecha_fin::date >= CURRENT_DATE)
                 """, (time_slot,))
             return [dict(r) for r in cur.fetchall()]
     finally:
