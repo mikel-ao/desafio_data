@@ -144,14 +144,6 @@ def fecha_fin_display(fecha_fin_str):
 
 # ── MODELOS DE DATOS ──────────────────────────────────────────────────────────
 
-class RecomendacionesRequest(BaseModel):
-    user_id: int
-    lat: float
-    lng: float
-    time_slot: str
-    municipio: Optional[str] = None
-    top_n: Optional[int] = 5
-
 class ActualizarPesosRequest(BaseModel):
     user_id: int
     activity_tags: List[str]
@@ -166,8 +158,15 @@ def health_check():
     return {"status": "ok", "service": "Motor de Recomendación — Data Science"}
 
 
-@app.post("/recomendaciones")
-def post_recomendaciones(req: RecomendacionesRequest):
+@app.get("/recomendaciones")
+def get_recomendaciones(
+    user_id: int,
+    lat: float,
+    lng: float,
+    time_slot: str,
+    municipio: Optional[str] = None,
+    top_n: int = 5
+):
     """
     Devuelve las top_n actividades más compatibles con el perfil del usuario.
 
@@ -178,8 +177,8 @@ def post_recomendaciones(req: RecomendacionesRequest):
       4. Calcular score ponderado por coincidencia de tags (sin duplicados)
       5. Ordenar por score DESC y devolver top_n
     """
-    weights    = obtener_o_crear_pesos(req.user_id)
-    activities = obtener_activities(req.time_slot, req.municipio)
+    weights    = obtener_o_crear_pesos(user_id)
+    activities = obtener_activities(time_slot, municipio)
 
     if not activities:
         return []
@@ -188,7 +187,7 @@ def post_recomendaciones(req: RecomendacionesRequest):
     for act in activities:
         if act["lat"] is None or act["lng"] is None:
             continue
-        distancia = haversine_km(req.lat, req.lng, float(act["lat"]), float(act["lng"]))
+        distancia = haversine_km(lat, lng, float(act["lat"]), float(act["lng"]))
         if distancia > 40.0:
             continue
 
@@ -212,7 +211,7 @@ def post_recomendaciones(req: RecomendacionesRequest):
         })
 
     candidatas.sort(key=lambda x: x["score"], reverse=True)
-    return candidatas[:req.top_n]
+    return candidatas[:top_n]
 
 
 @app.post("/actualizar-pesos")
